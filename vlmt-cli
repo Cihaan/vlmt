@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+import pulsectl
+import time
+import logging
+import math
+import argparse
+import json
+import os
+from typing import Dict, Optional
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass
+class Config:
+    max_db: float = -10.0
+    check_interval: float = 0.1
+    
+    @classmethod
+    def load(cls) -> 'Config':
+        config_path = Path.home() / '.config' / 'vlmt' / 'config.json'
+        if config_path.exists():
+            with open(config_path) as f:
+                data = json.load(f)
+                return cls(**data)
+        return cls()
+    
+    def save(self) -> None:
+        config_path = Path.home() / '.config' / 'vlmt' / 'config.json'
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump(self.__dict__, f, indent=2)
+
+class VolumeLimiter:
+    def __init__(self, config: Config):
+        self.config = config
+        self.pulse = pulsectl.Pulse('volume-limiter')
+        self.previous_volumes: Dict[str, float] = {}
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def get_stream_volume_db(self, stream) -> float:
+        volume = stream.volume.value_flat
+        return float('-inf') if volume <= 0 else 20 * math.log10(volume)
+
+    def set_stream_volume_db(self, stream, db: float) -> None:
+        linear_volume = 10 ** (db / 20)
+        self.pulse.volume_set_all_chans(stream, linear_volume)
+
+    def list_streams(self) -> None:
+        """List all active audio streams and their current volumes."""
+        streams = self.pulse.sink_input_list()
+        if not streams:
+            print("No active audio streams found.")
+            return
+        
+        print("\nActive Audio Streams:")
+        print("-" * 80)
+        print(f"{'ID':<5} {'Volume (dB)':<12} {'Application':<30} {'Media Name'}")
+        print("-" * 80)
+        
+        for stream in streams:
+            db = self.get_stream_volume_db(stream)
+            print(f"{stream.index:<5} {db:>6.1f} dB    {stream.name:<30} {stream.proplist.get('media.name', 'N/A')}")
+
+    def monitor_and_limit_volume(self) -> None:
+        try:
+            print(f"Volume limiter running (max: {self.config.max_db}dB)...")
+            print("Press Ctrl+C to stop")
+            
+            while True:
+                sink_inputs = self.pulse.sink_input_list()
+                
+                for stream in sink_inputs:
+                    current_db = self.get_stream_volume_db(stream)
+                    
+                    if current_db > self.config.max_db:
+                        self.logger.info(
+                            f"Limiting volume for {stream.name} "
+                            f"from {current_db:.1f}dB to {self.config.max_db:.1f}dB"
+                        )
+                        self.set_stream_volume_db(stream, self.config.max_db)
+                        self.previous_volumes[stream.name] = current_db
+                
+                time.sleep(self.config.check_interval)
+
+        except KeyboardInterrupt:
+            print("\nShutting down volume limiter...")
+        finally:
+            self.pulse.close()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Volume Limiter Management Tool (vlmt)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  vlmt start              Start the volume limiter
+  vlmt list              List all active audio streams
+  vlmt config --max-db -5  Set maximum volume to -5 dB
+  vlmt config --show      Show current configuration
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # Start command
+    start_parser = subparsers.add_parser('start', help='Start the volume limiter')
+    
+    # List command
+    list_parser = subparsers.add_parser('list', help='List all active audio streams')
+    
+    # Config command
+    config_parser = subparsers.add_parser('config', help='Configure volume limiter settings')
+    config_parser.add_argument('--max-db', type=float, help='Set maximum allowed volume in decibels')
+    config_parser.add_argument('--interval', type=float, help='Set check interval in seconds')
+    config_parser.add_argument('--show', action='store_true', help='Show current configuration')
+    
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = Config.load()
+    
+    if args.command == 'start':
+        limiter = VolumeLimiter(config)
+        limiter.monitor_and_limit_volume()
+    
+    elif args.command == 'list':
+        limiter = VolumeLimiter(config)
+        limiter.list_streams()
+        limiter.pulse.close()
+    
+    elif args.command == 'config':
+        if args.show:
+            print("\nCurrent Configuration:")
+            print(f"Maximum Volume: {config.max_db} dB")
+            print(f"Check Interval: {config.check_interval} seconds")
+        else:
+            modified = False
+            if args.max_db is not None:
+                config.max_db = args.max_db
+                modified = True
+            if args.interval is not None:
+                config.check_interval = args.interval
+                modified = True
+            
+            if modified:
+                config.save()
+                print("Configuration updated successfully")
+                print(f"Maximum Volume: {config.max_db} dB")
+                print(f"Check Interval: {config.check_interval} seconds")
+    
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
