@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+import tkinter as tk
+from tkinter import ttk
+import pulsectl
+import time
+import logging
+import math
+import json
+import threading
+from pathlib import Path
+from typing import Dict, Optional, List
+from dataclasses import dataclass
+import sys
+
+@dataclass
+class Config:
+    max_db: float = -10.0
+    check_interval: float = 0.1
+    
+    @classmethod
+    def load(cls) -> 'Config':
+        config_path = Path.home() / '.config' / 'vlmt' / 'config.json'
+        if config_path.exists():
+            with open(config_path) as f:
+                data = json.load(f)
+                return cls(**data)
+        return cls()
+    
+    def save(self) -> None:
+        config_path = Path.home() / '.config' / 'vlmt' / 'config.json'
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump(self.__dict__, f, indent=2)
+
+class StreamInfo:
+    def __init__(self, index: int, name: str, volume_db: float, media_name: str):
+        self.index = index
+        self.name = name
+        self.volume_db = volume_db
+        self.media_name = media_name
+
+class VolumeLimiterGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Volume Limiter")
+        self.root.geometry("600x400")
+        
+        # Load config
+        self.config = Config.load()
+        
+        # Initialize PulseAudio
+        self.pulse = pulsectl.Pulse('volume-limiter-gui')
+        
+        # Setup variables
+        self.is_running = False
+        self.limiter_thread = None
+        self.streams: List[StreamInfo] = []
+        
+        self.create_gui()
+        self.update_streams()
+        
+        # Start periodic updates
+        self.root.after(1000, self.periodic_update)
+
+    def create_gui(self):
+        # Create main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configuration section
+        config_frame = ttk.LabelFrame(main_frame, text="Configuration", padding="5")
+        config_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(config_frame, text="Max Volume (dB):").grid(row=0, column=0, padx=5)
+        self.max_db_var = tk.StringVar(value=str(self.config.max_db))
+        max_db_entry = ttk.Entry(config_frame, textvariable=self.max_db_var, width=10)
+        max_db_entry.grid(row=0, column=1, padx=5)
+        
+        ttk.Button(config_frame, text="Save", command=self.save_config).grid(row=0, column=2, padx=5)
+        
+        # Control section
+        control_frame = ttk.Frame(main_frame)
+        control_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        self.status_var = tk.StringVar(value="Status: Stopped")
+        ttk.Label(control_frame, textvariable=self.status_var).grid(row=0, column=0, padx=5)
+        
+        self.toggle_button = ttk.Button(control_frame, text="Start", command=self.toggle_limiter)
+        self.toggle_button.grid(row=0, column=1, padx=5)
+        
+        # Streams section
+        streams_frame = ttk.LabelFrame(main_frame, text="Active Streams", padding="5")
+        streams_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        # Create Treeview for streams
+        self.tree = ttk.Treeview(streams_frame, columns=("id", "name", "volume", "media"), show="headings")
+        self.tree.heading("id", text="ID")
+        self.tree.heading("name", text="Application")
+        self.tree.heading("volume", text="Volume (dB)")
+        self.tree.heading("media", text="Media Name")
+        
+        self.tree.column("id", width=50)
+        self.tree.column("name", width=150)
+        self.tree.column("volume", width=100)
+        self.tree.column("media", width=200)
+        
+        scrollbar = ttk.Scrollbar(streams_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        streams_frame.columnconfigure(0, weight=1)
+        streams_frame.rowconfigure(0, weight=1)
+        
+        # Make the streams section expandable
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(2, weight=1)
+
+    def save_config(self):
+        try:
+            self.config.max_db = float(self.max_db_var.get())
+            self.config.save()
+        except ValueError:
+            self.max_db_var.set(str(self.config.max_db))
+
+    def toggle_limiter(self):
+        if not self.is_running:
+            self.start_limiter()
+        else:
+            self.stop_limiter()
+
+    def start_limiter(self):
+        self.is_running = True
+        self.toggle_button.configure(text="Stop")
+        self.status_var.set("Status: Running")
+        
+        # Start limiter in a separate thread
+        self.limiter_thread = threading.Thread(target=self.limiter_loop, daemon=True)
+        self.limiter_thread.start()
+
+    def stop_limiter(self):
+        self.is_running = False
+        self.toggle_button.configure(text="Start")
+        self.status_var.set("Status: Stopped")
+
+    def get_stream_volume_db(self, stream) -> float:
+        volume = stream.volume.value_flat
+        return float('-inf') if volume <= 0 else 20 * math.log10(volume)
+
+    def set_stream_volume_db(self, stream, db: float) -> None:
+        linear_volume = 10 ** (db / 20)
+        self.pulse.volume_set_all_chans(stream, linear_volume)
+
+    def update_streams(self):
+        # Clear current items
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Add current streams
+        try:
+            streams = self.pulse.sink_input_list()
+            for stream in streams:
+                db = self.get_stream_volume_db(stream)
+                self.tree.insert("", tk.END, values=(
+                    stream.index,
+                    stream.name,
+                    f"{db:.1f}",
+                    stream.proplist.get('media.name', 'N/A')
+                ))
+        except:
+            pass
+
+    def limiter_loop(self):
+        while self.is_running:
+            try:
+                sink_inputs = self.pulse.sink_input_list()
+                
+                for stream in sink_inputs:
+                    current_db = self.get_stream_volume_db(stream)
+                    
+                    if current_db > self.config.max_db:
+                        self.set_stream_volume_db(stream, self.config.max_db)
+                
+                time.sleep(self.config.check_interval)
+            except:
+                continue
+
+    def periodic_update(self):
+        self.update_streams()
+        self.root.after(1000, self.periodic_update)
+
+    def on_closing(self):
+        self.stop_limiter()
+        self.pulse.close()
+        self.root.destroy()
+
+def main():
+    root = tk.Tk()
+    app = VolumeLimiterGUI(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
