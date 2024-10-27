@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import pulsectl
 import time
 import logging
 import math
 import json
 import threading
+import queue
 from pathlib import Path
 from typing import Dict, Optional, List
 from dataclasses import dataclass
@@ -32,12 +33,32 @@ class Config:
         with open(config_path, 'w') as f:
             json.dump(self.__dict__, f, indent=2)
 
-class StreamInfo:
-    def __init__(self, index: int, name: str, volume_db: float, media_name: str):
-        self.index = index
-        self.name = name
-        self.volume_db = volume_db
-        self.media_name = media_name
+class PulseAudioManager:
+    def __init__(self):
+        self._local = threading.local()
+        
+    def _get_pulse(self):
+        if not hasattr(self._local, 'pulse'):
+            self._local.pulse = pulsectl.Pulse('volume-limiter-gui')
+        return self._local.pulse
+    
+    def close(self):
+        if hasattr(self._local, 'pulse'):
+            self._local.pulse.close()
+            del self._local.pulse
+
+    def get_stream_volume_db(self, stream) -> float:
+        volume = stream.volume.value_flat
+        return float('-inf') if volume <= 0 else 20 * math.log10(volume)
+
+    def set_stream_volume_db(self, stream, db: float) -> None:
+        linear_volume = 10 ** (db / 20)
+        pulse = self._get_pulse()
+        pulse.volume_set_all_chans(stream, linear_volume)
+
+    def get_streams(self):
+        pulse = self._get_pulse()
+        return pulse.sink_input_list()
 
 class VolumeLimiterGUI:
     def __init__(self, root):
@@ -48,22 +69,23 @@ class VolumeLimiterGUI:
         # Load config
         self.config = Config.load()
         
-        # Initialize PulseAudio
-        self.pulse = pulsectl.Pulse('volume-limiter-gui')
+        # Initialize PulseAudio manager
+        self.pulse_manager = PulseAudioManager()
         
         # Setup variables
         self.is_running = False
         self.limiter_thread = None
-        self.streams: List[StreamInfo] = []
+        self.update_queue = queue.Queue()
         
         self.create_gui()
         self.update_streams()
         
         # Start periodic updates
         self.root.after(1000, self.periodic_update)
+        self.root.after(100, self.check_queue)
 
     def create_gui(self):
-        # Create main frame
+        # Create main frame with padding
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
@@ -110,18 +132,22 @@ class VolumeLimiterGUI:
         self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         
+        # Configure grid weights
         streams_frame.columnconfigure(0, weight=1)
         streams_frame.rowconfigure(0, weight=1)
-        
-        # Make the streams section expandable
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(2, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
     def save_config(self):
         try:
-            self.config.max_db = float(self.max_db_var.get())
+            new_db = float(self.max_db_var.get())
+            self.config.max_db = new_db
             self.config.save()
+            messagebox.showinfo("Success", "Configuration saved successfully!")
         except ValueError:
+            messagebox.showerror("Error", "Please enter a valid number for maximum dB")
             self.max_db_var.set(str(self.config.max_db))
 
     def toggle_limiter(self):
@@ -135,7 +161,6 @@ class VolumeLimiterGUI:
         self.toggle_button.configure(text="Stop")
         self.status_var.set("Status: Running")
         
-        # Start limiter in a separate thread
         self.limiter_thread = threading.Thread(target=self.limiter_loop, daemon=True)
         self.limiter_thread.start()
 
@@ -144,47 +169,55 @@ class VolumeLimiterGUI:
         self.toggle_button.configure(text="Start")
         self.status_var.set("Status: Stopped")
 
-    def get_stream_volume_db(self, stream) -> float:
-        volume = stream.volume.value_flat
-        return float('-inf') if volume <= 0 else 20 * math.log10(volume)
-
-    def set_stream_volume_db(self, stream, db: float) -> None:
-        linear_volume = 10 ** (db / 20)
-        self.pulse.volume_set_all_chans(stream, linear_volume)
-
     def update_streams(self):
-        # Clear current items
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        
-        # Add current streams
         try:
-            streams = self.pulse.sink_input_list()
+            # Clear current items
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            
+            # Add current streams
+            streams = self.pulse_manager.get_streams()
             for stream in streams:
-                db = self.get_stream_volume_db(stream)
+                db = self.pulse_manager.get_stream_volume_db(stream)
                 self.tree.insert("", tk.END, values=(
                     stream.index,
                     stream.name,
                     f"{db:.1f}",
                     stream.proplist.get('media.name', 'N/A')
                 ))
-        except:
-            pass
+        except Exception as e:
+            self.status_var.set(f"Status: Error updating streams")
 
     def limiter_loop(self):
+        local_pulse_manager = PulseAudioManager()
+        
         while self.is_running:
             try:
-                sink_inputs = self.pulse.sink_input_list()
+                sink_inputs = local_pulse_manager.get_streams()
                 
                 for stream in sink_inputs:
-                    current_db = self.get_stream_volume_db(stream)
+                    current_db = local_pulse_manager.get_stream_volume_db(stream)
                     
                     if current_db > self.config.max_db:
-                        self.set_stream_volume_db(stream, self.config.max_db)
+                        local_pulse_manager.set_stream_volume_db(stream, self.config.max_db)
+                        self.update_queue.put(True)  # Signal for GUI update
                 
                 time.sleep(self.config.check_interval)
-            except:
-                continue
+            except Exception as e:
+                print(f"Error in limiter loop: {e}")
+                time.sleep(1)  # Avoid tight loop on error
+                
+        local_pulse_manager.close()
+
+    def check_queue(self):
+        try:
+            while True:
+                self.update_queue.get_nowait()
+                self.update_streams()
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(100, self.check_queue)
 
     def periodic_update(self):
         self.update_streams()
@@ -192,14 +225,18 @@ class VolumeLimiterGUI:
 
     def on_closing(self):
         self.stop_limiter()
-        self.pulse.close()
+        self.pulse_manager.close()
         self.root.destroy()
 
 def main():
-    root = tk.Tk()
-    app = VolumeLimiterGUI(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        app = VolumeLimiterGUI(root)
+        root.protocol("WM_DELETE_WINDOW", app.on_closing)
+        root.mainloop()
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
